@@ -1,6 +1,6 @@
 import base64
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, HTTPException, Form, File
+from fastapi import FastAPI, UploadFile, HTTPException, Form, File,Body
 import google.generativeai as genai
 import os
 from pydantic import BaseModel
@@ -16,8 +16,11 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
-
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, EmailStr
+from sendgrid_email import send_email
+from trello import TrelloClient
+from langchain_community.document_loaders import TrelloLoader
 # Load environment variables
 load_dotenv()
 
@@ -27,7 +30,9 @@ app = FastAPI()
 # Configure Gemini API
 os.environ["GOOGLE_API_KEY"] = "AIzaSyDUoABlR_TAkDcyrjCWKvIxJFAZWpBF_1I"
 genai.configure(api_key=os.environ["GOOGLE_API_KEY"]) 
-
+api_key = "e398b664116ed0be68c419dc0d0807df"
+api_token = "put used_token here"
+#used_token="ATTA01800378a7d4e9c2d39ed72d9ef9dd81d070903ccd0c0e7cc59b8483e6461dba285B1CC4"
 # Gemini Flash model for transcription and NLP
 generation_config = {
     "temperature": 0.1,
@@ -36,12 +41,26 @@ generation_config = {
     "max_output_tokens": 1024,
     "response_mime_type": "text/plain",
 }
-#configuration the model 
+
 model = genai.GenerativeModel(
     model_name="gemini-2.0-flash",
     generation_config=generation_config,
 )
+#for trello
+client = TrelloClient(
+    api_key=api_key,
+    api_secret='',  
+    token=api_token
+)
+class BoardRequest(BaseModel):
+    board_name: str
 
+class CardRequest(BaseModel):
+    board_name: str
+    list_name: str
+    card_name: str
+    card_desc: str = "" 
+    due_date: str = None
 # Vector DB
 VECTOR_DB_PATH = "transcribed_audio_chunks_chroma"
 embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
@@ -249,3 +268,100 @@ async def ask_question(question: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Question error: {e}")
+# from fastapi import FastAPI, HTTPException
+# from pydantic import BaseModel
+
+# app = FastAPI()
+
+# class QuestionRequest(BaseModel):
+#     question: str
+
+# from fastapi import FastAPI, HTTPException
+# from pydantic import BaseModel
+
+# app = FastAPI()
+
+# class QuestionRequest(BaseModel):
+
+# @app.post("/ask_question/")
+# async def ask_question(request: QuestionRequest):
+#     try:
+#         return {
+#             "answer": f"تم استقبال سؤالك: {request.question}",
+#             "related_paragraphs": "هذا مثال على الفقرة المرتبطة"
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# # لو عندك كاش من التفريغ
+# transcription_cache = {
+#     "latest": {
+#         "text": "ده مثال على النص اللي هيتبعت",
+#     }
+# }
+# class EmailRequest(BaseModel):
+#     to_email: EmailStr
+
+# @app.post("/send_transcription/")
+# async def send_transcription_email(request: EmailRequest):
+#     if "latest" not in transcription_cache:
+#         raise HTTPException(status_code=400, detail="No transcription found")
+
+#     content = transcription_cache["latest"]["text"]
+#     subject = "تفريغ الصوت أو المُلخص بتاعك"
+
+#     success = send_email(request.to_email, subject, content)
+#     if not success:
+#         raise HTTPException(status_code=500, detail="فشل في إرسال الإيميل")
+
+#     return {"message": "تم إرسال الإيميل بنجاح ✅"}
+@app.post("/extract_and_add_tasks/")
+async def extract_and_add_tasks(
+    board_name: str = Body(...),
+    list_name: str = Body(...)
+):
+    """Extract tasks and add them as cards to a Trello list."""
+    if "latest" not in transcription_cache:
+        raise HTTPException(status_code=400, detail="No transcribed text found.")
+
+    try:
+        # Step 1: Extract tasks from the latest transcription
+        prompt = f"""
+        Extract all actionable tasks from this text:
+        {transcription_cache["latest"]["text"]}
+        Return only a list of tasks, each on a new line, without extra explanations.
+        """
+        response = model.generate_content(prompt)
+        tasks_text = response.text.strip()
+        tasks = [task.strip("-• ") for task in tasks_text.split("\n") if task.strip()]
+
+        if not tasks:
+            raise HTTPException(status_code=400, detail="No tasks found.")
+
+        # Step 2: Find the board
+        boards = client.list_boards()
+        board = next((b for b in boards if b.name.lower() == board_name.lower()), None)
+        if not board:
+            raise HTTPException(status_code=404, detail="Board not found.")
+
+        # Step 3: Find the list
+        lists = board.list_lists()
+        target_list = next((l for l in lists if l.name.lower() == list_name.lower()), None)
+        if not target_list:
+            raise HTTPException(status_code=404, detail="List not found.")
+
+        # Step 4: Add each task as a card
+        added_cards = []
+        for task in tasks:
+            card = target_list.add_card(name=task)
+            added_cards.append({"task": task, "card_id": card.id, "card_url": card.url})
+
+        return {
+            "message": "Tasks extracted and added to Trello successfully.",
+            "tasks": added_cards
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during task extraction or Trello interaction: {e}")
