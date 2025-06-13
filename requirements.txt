@@ -7,7 +7,3 @@ langchain-google-genai
 langchain-community
 chromadb
 pydantic
-<<<<<<< HEAD
-
-=======
->>>>>>> 7e0806e299a320db651c84dbc909e3e445970084

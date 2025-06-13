@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, EmailStr
-from sendgrid_email import send_email
+# from sendgrid_email import send_email
 from trello import TrelloClient
 from langchain_community.document_loaders import TrelloLoader
 # Load environment variables
@@ -27,11 +27,24 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Configure Gemini API
-os.environ["GOOGLE_API_KEY"] = "AIzaSyDUoABlR_TAkDcyrjCWKvIxJFAZWpBF_1I"
+# os.environ["GOOGLE_API_KEY"] = "AIzaSyDUoABlR_TAkDcyrjCWKvIxJFAZWpBF_1I"
+os.environ["GOOGLE_API_KEY"] =  os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.environ["GOOGLE_API_KEY"]) 
-api_key = "e398b664116ed0be68c419dc0d0807df"
-api_token = "put used_token here"
+# api_key = "e398b664116ed0be68c419dc0d0807df"
+api_key = os.getenv("api_token")
+# api_token = "ATTA01800378a7d4e9c2d39ed72d9ef9dd81d070903ccd0c0e7cc59b8483e6461dba285B1CC4"
+api_token = os.getenv("api_token")
 #used_token="ATTA01800378a7d4e9c2d39ed72d9ef9dd81d070903ccd0c0e7cc59b8483e6461dba285B1CC4"
 # Gemini Flash model for transcription and NLP
 generation_config = {
