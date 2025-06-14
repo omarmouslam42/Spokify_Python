@@ -1,30 +1,27 @@
-import base64
-from datetime import datetime
-from fastapi import FastAPI, UploadFile, HTTPException, Form, File,Body
-import google.generativeai as genai
 import os
-from pydantic import BaseModel
-from langchain.schema import Document
+import re
+import base64
+from typing import List
+from datetime import datetime
+
+from fastapi import FastAPI, UploadFile, File, Body, Form, HTTPException
+from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-from langchain_community.vectorstores import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_core.runnables import Runnable
+from trello import TrelloClient
+import requests
+import google.generativeai as genai
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import re
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, EmailStr
-# from sendgrid_email import send_email
-from trello import TrelloClient
-from langchain_community.document_loaders import TrelloLoader
-# Load environment variables
+from langchain_core.runnables import Runnable
+from langchain.schema import Document
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+
+# ✅ تحميل المتغيرات من .env
 load_dotenv()
 
-# Initialize FastAPI
+# ✅ تهيئة FastAPI
 app = FastAPI()
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,16 +34,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure Gemini API
-# os.environ["GOOGLE_API_KEY"] = "AIzaSyDUoABlR_TAkDcyrjCWKvIxJFAZWpBF_1I"
-os.environ["GOOGLE_API_KEY"] =  os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=os.environ["GOOGLE_API_KEY"]) 
-# api_key = "e398b664116ed0be68c419dc0d0807df"
-api_key = os.getenv("api_token")
-# api_token = "ATTA01800378a7d4e9c2d39ed72d9ef9dd81d070903ccd0c0e7cc59b8483e6461dba285B1CC4"
-api_token = os.getenv("api_token")
-#used_token="ATTA01800378a7d4e9c2d39ed72d9ef9dd81d070903ccd0c0e7cc59b8483e6461dba285B1CC4"
-# Gemini Flash model for transcription and NLP
+# ✅ مفاتيح Gemini و Trello
+os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+api_key = os.getenv("api_key")  # Trello public key
+genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+
+# ✅ كاش مؤقت للنصوص
+transcription_cache = {}
+
+# ✅ إعداد نموذج Gemini
 generation_config = {
     "temperature": 0.1,
     "top_p": 0,
@@ -54,17 +50,11 @@ generation_config = {
     "max_output_tokens": 1024,
     "response_mime_type": "text/plain",
 }
-
 model = genai.GenerativeModel(
     model_name="gemini-2.0-flash",
     generation_config=generation_config,
 )
-#for trello
-client = TrelloClient(
-    api_key=api_key,
-    api_secret='',  
-    token=api_token
-)
+
 class BoardRequest(BaseModel):
     board_name: str
 
@@ -105,7 +95,10 @@ async def transcribe_audio_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
 # Store to Chroma
 async def store_to_chroma(text: str):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=700,        # حجم chunk أكبر لتوفير سياق أفضل
+        chunk_overlap=100      # تداخل عشان السياق يكمل بعضه
+    )
     chunks = text_splitter.split_text(text)
     documents = [Document(page_content=chunk) for chunk in chunks]
 
@@ -117,13 +110,18 @@ async def store_to_chroma(text: str):
     vectorstore.persist()
     return len(documents)
 
+# Load vector store
 def get_vectorstore():
     return Chroma(
         persist_directory=VECTOR_DB_PATH,
         embedding_function=embedding_model,
     )
 
-retriever = get_vectorstore().as_retriever(search_type="similarity", search_kwargs={"k": 5})
+# استخدم MMR search بدل Similarity
+retriever = get_vectorstore().as_retriever(
+    search_type="mmr",  # MMR للنتائج الأكثر تنوعًا ودلالة
+    search_kwargs={"k": 5}
+)
 
 # NLP utilities
 async def summarize_text(text: str):
@@ -155,6 +153,7 @@ async def enhance_text(text: str):
         return response.text  # Extract enhanced text
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error enhancing text: {e}")
+
 @app.get("/detect_topics/")
 async def detect_topics_latest():
     if "latest" not in transcription_cache:
@@ -198,7 +197,10 @@ async def transcribe(file: UploadFile = File(...)):
             }
         }
 
+        # ✅ إعادة تحميل الـ Retriever بعد التخزين
+        global retriever
         chunks_stored = await store_to_chroma(transcription_text)
+        retriever = get_vectorstore().as_retriever(search_type="mmr", search_kwargs={"k": 5})
 
         return {
             "transcription": transcription_text,
@@ -246,135 +248,309 @@ async def extract_tasks():
     """
     response = model.generate_content(prompt)
     return {"tasks": response.text.strip()}
+from pydantic import BaseModel
+
+class QuestionRequest(BaseModel):
+    question: str
 
 @app.post("/ask_question/")
-async def ask_question(question: str):
+async def ask_question(request: QuestionRequest):
     try:
+        question = request.question.strip()
+
+        # البحث في المتجهات
         vectorstore = get_vectorstore()
-        raw_docs = vectorstore.get()["documents"]
-        keywords = re.findall(r'\w+', question.lower())
+        retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5})
+        docs = retriever.invoke(question)
 
-        matching_docs = []
-        for doc in raw_docs:
-            doc_lower = doc.lower()
-            if all(word in doc_lower for word in keywords):
-                matching_docs.append(doc)
+        if not docs:
+            return {"answer": "No relevant paragraphs found.", "related_paragraphs": ""}
 
-        if not matching_docs:
-            return {"answer": "No related paragraphs found.", "related_paragraphs": ""}
+        # بناء السياق من الفقرات
+        context = "\n\n".join([f"PARAGRAPH {i+1}:\n{doc.page_content}" for i, doc in enumerate(docs)])
 
-        context = "\n\n".join([f"PARAGRAPH {i+1}:\n{doc}" for i, doc in enumerate(matching_docs)])
+        # بناء البرومبت
         prompt = f"""
-        Answer the question using the paragraphs below:
+        Use the following paragraphs to answer the question.
+
         {context}
 
         Question: {question}
         Answer:
         """
 
-        response = model.generate_content(prompt)
+        # إرسال البرومبت إلى ChatGoogleGenerativeAI
+        response = chat_model.invoke(prompt)
 
         return {
-            "answer": response.text.strip(),
+            "answer": response.content.strip(),
             "related_paragraphs": context
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Question error: {e}")
-# from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel
-
-# app = FastAPI()
-
-# class QuestionRequest(BaseModel):
-#     question: str
-
-# from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel
-
-# app = FastAPI()
-
-# class QuestionRequest(BaseModel):
-
-# @app.post("/ask_question/")
-# async def ask_question(request: QuestionRequest):
-#     try:
-#         return {
-#             "answer": f"تم استقبال سؤالك: {request.question}",
-#             "related_paragraphs": "هذا مثال على الفقرة المرتبطة"
-#         }
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-
-# # لو عندك كاش من التفريغ
-# transcription_cache = {
-#     "latest": {
-#         "text": "ده مثال على النص اللي هيتبعت",
-#     }
-# }
-# class EmailRequest(BaseModel):
-#     to_email: EmailStr
-
-# @app.post("/send_transcription/")
-# async def send_transcription_email(request: EmailRequest):
+# @app.post("/extract_and_add_tasks/")
+# async def extract_and_add_tasks(
+#     board_name: str = Body(...),
+#     list_name: str = Body(...),
+#     members: List[str] = Body(default=[]),  # قائمة الإيميلات
+# ):
 #     if "latest" not in transcription_cache:
-#         raise HTTPException(status_code=400, detail="No transcription found")
+#         raise HTTPException(status_code=400, detail="No transcribed text found.")
 
-#     content = transcription_cache["latest"]["text"]
-#     subject = "تفريغ الصوت أو المُلخص بتاعك"
+#     try:
+#         # 🧠 1. استخراج المهام من النص
+#         prompt = f"""
+#         Extract all actionable tasks from this text:
+#         {transcription_cache["latest"]["text"]}
+#         Return only a list of tasks, each on a new line, without extra explanations.
+#         """
+#         response = model.generate_content(prompt)
+#         tasks_text = response.text.strip()
+#         tasks = [task.strip("-• ") for task in tasks_text.split("\n") if task.strip()]
 
-#     success = send_email(request.to_email, subject, content)
-#     if not success:
-#         raise HTTPException(status_code=500, detail="فشل في إرسال الإيميل")
+#         if not tasks:
+#             raise HTTPException(status_code=400, detail="No tasks found.")
 
-#     return {"message": "تم إرسال الإيميل بنجاح ✅"}
+#         # 📦 2. إيجاد أو إنشاء البورد
+#         boards = client.list_boards()
+#         board = next((b for b in boards if b.name.lower() == board_name.lower()), None)
+#         if not board:
+#             board = client.add_board(board_name)
+#         board_id = board.id
+
+#         # ➕ 3. إضافة الأعضاء إلى البورد
+#         for member_email in members:
+#             add_member_url = f"https://api.trello.com/1/boards/{board_id}/members"
+#             r = requests.put(
+#                 add_member_url,
+#                 params={
+#                     "key": api_key,
+#                     "token": api_token,
+#                     "email": member_email,
+#                     "type": "normal"
+#                 }
+#             )
+#             if r.status_code not in [200, 202]:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail=f"Failed to add member {member_email}: {r.text}"
+#                 )
+
+#         # 🧾 4. إيجاد أو إنشاء القائمة (List)
+#         lists = board.list_lists()
+#         target_list = next((l for l in lists if l.name.lower() == list_name.lower()), None)
+#         if not target_list:
+#             target_list = board.add_list(name=list_name, pos="bottom")
+
+#         # 📌 5. إضافة المهام كبطاقات
+#         added_cards = []
+#         for task in tasks:
+#             card = target_list.add_card(name=task)
+#             added_cards.append({
+#                 "task": task,
+#                 "card_id": card.id,
+#                 "card_url": card.url
+#             })
+
+#         return {
+#             "message": "Tasks extracted and added to Trello successfully.",
+#             "tasks": added_cards,
+#             "members_added": members
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error during task extraction or Trello interaction: {e}")
+
+# @app.post("/extract_and_add_tasks/")
+# async def extract_and_add_tasks(
+#     board_name: str = Body(...),
+#     list_name: str = Body(...),
+#     members: List[str] = Body(default=[]),
+#     user_token: str = Body(...),
+# ):
+#     if "latest" not in transcription_cache:
+#         raise HTTPException(status_code=400, detail="لم يتم العثور على نص لتحليله. يرجى تسجيل صوت أولاً.")
+
+#     try:
+#         # استخراج المهام باستخدام Gemini
+#         prompt = f"""
+#         Extract all actionable tasks from this text:
+#         {transcription_cache["latest"]["text"]}
+#         Return only a list of tasks, each on a new line, without extra explanations.
+#         """
+#         response = model.generate_content(prompt)
+#         tasks_text = response.text.strip()
+#         tasks = [task.strip("-• ") for task in tasks_text.split("\n") if task.strip()]
+
+#         if not tasks:
+#             raise HTTPException(status_code=400, detail="لم يتم العثور على أي مهام قابلة للتنفيذ.")
+
+#         # إعداد TrelloClient باستخدام توكن المستخدم
+#         client = TrelloClient(
+#             api_key=api_key,
+#             api_secret=None,
+#             token=user_token
+#         )
+
+#         # الحصول على البورد أو إنشاؤه
+#         boards = client.list_boards()
+#         board = next((b for b in boards if b.name.lower() == board_name.lower()), None)
+#         if not board:
+#             board = client.add_board(board_name)
+
+#         # الحصول على الليست أو إنشاؤها
+#         lists = board.list_lists()
+#         target_list = next((l for l in lists if l.name.lower() == list_name.lower()), None)
+#         if not target_list:
+#             target_list = board.add_list(name=list_name, pos="bottom")
+
+#         # إضافة الكروت
+#         added_cards = []
+#         for task in tasks:
+#             card = target_list.add_card(name=task)
+#             added_cards.append({
+#                 "task": task,
+#                 "card_id": card.id,
+#                 "card_url": card.url
+#             })
+
+#         # دعوة الأعضاء للبورد
+#         board_id = board.id
+#         for member in members:
+#             add_member_url = f"https://api.trello.com/1/boards/{board_id}/members"
+#             response = requests.put(
+#                 add_member_url,
+#                 params={
+#                     "key": api_key,
+#                     "token": user_token,
+#                     "email": member,
+#                     "type": "normal",
+#                 },
+#             )
+#             if response.status_code not in [200, 202]:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail=f"فشل في دعوة العضو {member}: {response.text}",
+#                 )
+
+#         return {
+#             "message": "تم استخراج المهام وإضافتها بنجاح إلى Trello.",
+#             "tasks": added_cards
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء التعامل مع Trello: {str(e)}")
+
+
+import requests
+
+
 @app.post("/extract_and_add_tasks/")
 async def extract_and_add_tasks(
     board_name: str = Body(...),
-    list_name: str = Body(...)
+    list_name: str = Body(...),
+    members: List[str] = Body(default=[]),
+    user_token: str = Body(...),
 ):
-    """Extract tasks and add them as cards to a Trello list."""
     if "latest" not in transcription_cache:
-        raise HTTPException(status_code=400, detail="No transcribed text found.")
+        raise HTTPException(status_code=400, detail="لم يتم العثور على نص لتحليله. يرجى تسجيل صوت أولاً.")
 
     try:
-        # Step 1: Extract tasks from the latest transcription
+        # استخراج المهام باستخدام نموذج Gemini (أو بديل حسب مشروعك)
         prompt = f"""
         Extract all actionable tasks from this text:
         {transcription_cache["latest"]["text"]}
         Return only a list of tasks, each on a new line, without extra explanations.
         """
+        # ← استبدل هذا بالسطر الخاص بنموذج الذكاء الاصطناعي اللي بتستخدمه
         response = model.generate_content(prompt)
         tasks_text = response.text.strip()
         tasks = [task.strip("-• ") for task in tasks_text.split("\n") if task.strip()]
 
         if not tasks:
-            raise HTTPException(status_code=400, detail="No tasks found.")
+            raise HTTPException(status_code=400, detail="لم يتم العثور على أي مهام قابلة للتنفيذ.")
 
-        # Step 2: Find the board
+        # إعداد Trello client
+        client = TrelloClient(
+            api_key=api_key,
+            api_secret=None,
+            token=user_token
+        )
+
+        # الحصول أو إنشاء البورد
         boards = client.list_boards()
         board = next((b for b in boards if b.name.lower() == board_name.lower()), None)
         if not board:
-            raise HTTPException(status_code=404, detail="Board not found.")
+            board = client.add_board(board_name)
 
-        # Step 3: Find the list
+        # الحصول أو إنشاء الليست
         lists = board.list_lists()
         target_list = next((l for l in lists if l.name.lower() == list_name.lower()), None)
         if not target_list:
-            raise HTTPException(status_code=404, detail="List not found.")
+            target_list = board.add_list(name=list_name, pos="bottom")
 
-        # Step 4: Add each task as a card
+        # إضافة الكروت
         added_cards = []
         for task in tasks:
             card = target_list.add_card(name=task)
-            added_cards.append({"task": task, "card_id": card.id, "card_url": card.url})
+            added_cards.append({
+                "task": task,
+                "card_id": card.id,
+                "card_url": card.url
+            })
+
+        # ✅ إضافة الأعضاء إلى البورد
+        board_id = board.id
+        for member_email in members:
+            invite_url = f"https://api.trello.com/1/boards/{board_id}/members"
+            invite_params = {
+                "key": api_key,
+                "token": user_token,
+                "email": member_email,
+                "type": "normal"
+            }
+            response = requests.put(invite_url, params=invite_params)
+
+            if response.status_code not in [200, 202]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"فشل في دعوة العضو {member_email}: {response.text}"
+                )
 
         return {
-            "message": "Tasks extracted and added to Trello successfully.",
+            "message": "تم استخراج المهام وإضافتها إلى Trello بنجاح.",
             "tasks": added_cards
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during task extraction or Trello interaction: {e}")
+        raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء التعامل مع Trello: {str(e)}")
+
+@app.get("/extract_title/")
+async def extract_title():
+    if "latest" not in transcription_cache:
+        raise HTTPException(status_code=400, detail="No transcription found.")
+
+    text = transcription_cache["latest"]["text"]
+
+    prompt = (
+        "Generate a short and clear title (maximum 5 words) for the following text. "
+        "Do not add any formatting, stars, quotation marks, or explanations. Just return the title only:\n\n"
+        f"{text}"
+    )
+
+    try:
+        response = model.generate_content(prompt)
+        raw_title = response.text.strip()
+
+        # Remove unwanted formatting like *, ", newlines, etc.
+        clean_title = re.sub(r'[*"\n]', '', raw_title).strip()
+
+        # Optional: Enforce word limit strictly
+        words = clean_title.split()
+        if len(words) > 5:
+            clean_title = ' '.join(words[:5])
+
+        return {"title": clean_title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error extracting title: {e}")
